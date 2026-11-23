@@ -4,3 +4,6 @@ config.json
 members.json
 .pytest_cache/
 .venv/
+*.swp
+*.swo
+.DS_Store
