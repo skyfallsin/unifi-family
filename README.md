@@ -1,17 +1,26 @@
 # unifi-family
 
 A small CLI over the official **UniFi Network Integration API** (v11.0.97) for
-allowing/blocking websites on specific devices — built for managing kids'
+allowing/blocking websites on specific devices — built for managing a family's
 devices.
 
 ## Install
 
+Uses [uv](https://docs.astral.sh/uv/). The script declares its own
+dependencies inline (PEP 723), so there's nothing to install separately — `uv`
+fetches them on first run into an isolated environment.
+
 ```bash
-cd unifi-cli
-pip install -r requirements.txt
-# optional: symlink onto your PATH
+# run it directly
+uv run --script unifi-family --help
+
+# or put it on your PATH (the shebang runs it via `uv run`)
+chmod +x unifi-family
 ln -s "$PWD/unifi-family" /usr/local/bin/unifi-family
+unifi-family --help
 ```
+
+(If you don't have uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`.)
 
 ## Connect
 
@@ -36,99 +45,105 @@ unifi-family config --base-url https://192.168.1.1 --api-key LOCAL_KEY
 Settings are written to `~/.config/unifi/config.json` (chmod 600). Env vars
 `UNIFI_BASE_URL` / `UNIFI_API_KEY` / `UNIFI_SITE` also work.
 
-## Everyday use
-
-### Members (map a person to their devices)
-
-Members are a local convenience stored in `~/.config/unifi/members.json`. Once a
-person has devices attached, you can use their name anywhere a device is
-expected (`block`, `review`), and it expands to all their MACs.
+## Inspect what's on the network
 
 ```bash
-unifi-family members list                        # list members + devices
-unifi-family members add naveen                  # create a member
-unifi-family members naveen add "Naveen"          # attach a device (by name/MAC/IP)
-unifi-family members naveen add "Kids iPad"       # attach another
-unifi-family members naveen                       # show naveen's devices
-unifi-family members naveen remove "Kids iPad"    # detach a device
-unifi-family members delete naveen               # remove the member
-
-# Then use the member name directly:
-unifi-family review naveen
-unifi-family block naveen --domain reddit.com
-
-# Target ONE device of a member with member:filter (matches device name):
-unifi-family block naveen:ipad --domain tiktok.com
-unifi-family review naveen:mbp
+unifi-family sites                      # list sites
+unifi-family clients                    # name, MAC, IP of everything connected
+unifi-family clients laptop             # filter
+unifi-family devices                    # rich detail: maker, hostname, AP, first/last seen
+unifi-family zones                      # firewall zones
+unifi-family dpi-categories vpn         # DPI category ids (for --app-category)
 ```
 
-### Custom times (per device, per person)
+`devices` is the one to use when figuring out which client is whose — it shows
+each client's maker/OUI, hostname, which access point (room) it's near, and
+whether its MAC is randomized.
+
+## Members (map a person to their devices)
+
+Members are a **local** convenience stored in `~/.config/unifi/members.json`
+(they are not pushed to UniFi). Attach devices to a person, then use that name
+anywhere a device is expected (`block`, `review`) and it expands to all their
+MACs.
+
+```bash
+unifi-family members list                         # list members + devices, grouped
+unifi-family members add alex kid                 # create a member (optional group: kid/adult)
+unifi-family members add robin adult
+unifi-family members alex add "Alex Laptop"       # attach a device (by name/MAC/IP)
+unifi-family members alex add 6a:23:fb:dc:d7:0a   # attach by MAC
+unifi-family members alex                         # show alex's devices
+unifi-family members alex remove "Alex Laptop"    # detach a device
+unifi-family members delete alex                  # remove the member
+
+# Use a member name directly:
+unifi-family review alex
+unifi-family block alex --domain reddit.com
+
+# Target ONE device of a member with member:filter (matches device name):
+unifi-family block alex:laptop --domain tiktok.com
+unifi-family review alex:phone
+```
+
+## Block / allow
+
+```bash
+# Block domains for a device (matched by name, MAC, IP, or member):
+unifi-family block "Alex Laptop" --domain tiktok.com --domain youtube.com
+
+# Block a whole DPI category, e.g. VPN/proxy (id 11):
+unifi-family block "Alex Laptop" --app-category 11
+
+# Allow-list a site (ALLOW rule, evaluated before blocks):
+unifi-family block --allow "Alex Laptop" --domain khanacademy.org
+
+# Preview the payload without sending it:
+unifi-family block "Alex Laptop" --domain tiktok.com --dry-run
+```
+
+## Custom times (per device, per person)
 
 Any `block` can be scoped to a time window, specific weekdays, a date range, or
 a single day:
 
 ```bash
-# Daily window (block 8pm\u20137am every day):
-unifi-family block naveen:ipad --domain roblox.com --start 20:00 --stop 07:00
+# Daily window (block 8pm–7am every day):
+unifi-family block alex:laptop --domain roblox.com --start 20:00 --stop 07:00
 
 # School nights only (weekdays), overnight:
-unifi-family block naveen:ipad --app-category 8 --days weekdays --start 20:00 --stop 07:00
+unifi-family block alex:laptop --app-category 8 --days weekdays --start 20:00 --stop 07:00
 
 # Weekends all day:
-unifi-family block naveen:ipad --domain tiktok.com --days weekends
+unifi-family block alex:laptop --domain tiktok.com --days weekends
 
-# Specific days:
-unifi-family block naveen:ipad --domain youtube.com --days mon,wed,fri --start 16:00 --stop 18:00
+# Specific days and a time window:
+unifi-family block alex:laptop --domain youtube.com --days mon,wed,fri --start 16:00 --stop 18:00
 
-# A date range (e.g. exam period), optionally limited to weekdays/time:
-unifi-family block naveen:ipad --domain discord.com \
+# A date range (e.g. exam period):
+unifi-family block alex:laptop --domain discord.com \
   --start-date 2026-12-01 --stop-date 2026-12-15
 
 # One-time only, for a single date:
-unifi-family block naveen:ipad --domain x.com --date 2026-12-25
+unifi-family block alex:laptop --domain x.com --date 2026-12-25
 ```
 
 Scheduling flags:
-- `--start HH:MM --stop HH:MM` \u2014 active time window (24h; can cross midnight)
-- `--days` \u2014 `mon,tue,...` or `weekdays` / `weekends` / `everyday`
-- `--start-date / --stop-date YYYY-MM-DD` \u2014 a custom date range (`CUSTOM`)
-- `--date YYYY-MM-DD` \u2014 one time only (`ONE_TIME_ONLY`)
+- `--start HH:MM --stop HH:MM` — active time window (24h; can cross midnight)
+- `--days` — `mon,tue,…` or `weekdays` / `weekends` / `everyday`
+- `--start-date / --stop-date YYYY-MM-DD` — a custom date range (`CUSTOM`)
+- `--date YYYY-MM-DD` — one time only (`ONE_TIME_ONLY`)
 
 Each rule applies only to the device(s) you target, so every device for every
-person can carry its own set of blocks on its own schedule. Use
-`unifi-family review <device|member|member:filter>` to see the effective
-allow/block list and the exact times.
+person can carry its own set of blocks on its own schedule.
+
+## See and manage the rules
 
 ```bash
-unifi-family sites                      # list sites
-unifi-family clients                    # name, MAC, IP of everything connected
-unifi-family clients ipad               # filter
-unifi-family zones                      # firewall zones
-unifi-family dpi-categories vpn         # DPI category ids (for --app-category)
+# Effective rules affecting a device/member, in evaluation order:
+unifi-family review alex
+unifi-family review alex --all          # include every zone pair
 
-# Block domains for a device (matched by name, MAC, or IP):
-unifi-family block "Kids iPad" --domain tiktok.com --domain youtube.com
-
-# Block a whole DPI category, e.g. VPN/proxy (id 11):
-unifi-family block "Kids iPad" --app-category 11
-
-# Only during set hours each day (e.g. block games 9pm–7am):
-unifi-family block "Kids iPad" --domain roblox.com --start 21:00 --stop 07:00
-
-# Allow-list instead of block:
-unifi-family block --allow "Kids iPad" --domain khanacademy.org
-
-# Multiple devices in one rule:
-unifi-family block "Kids iPad" "Kids Laptop" --domain tiktok.com
-
-# See every rule affecting a device, in the order the firewall evaluates them:
-unifi-family review "Kids iPad"
-unifi-family review "Kids iPad" --all   # include every zone pair
-
-# Preview a payload without sending:
-unifi-family block "Kids iPad" --domain tiktok.com --dry-run
-
-# Manage existing rules:
 unifi-family policies list
 unifi-family policies get <id>
 unifi-family policies rename <id> "New name"
@@ -149,7 +164,7 @@ It creates a **zone-based firewall policy**:
 - **destination**: the `External` zone, filtered to the given domain(s) or DPI
   app-category(ies)
 - **ipProtocolScope**: IPv4 + IPv6
-- optional daily **schedule** via `--start/--stop`
+- optional **schedule** via `--start/--stop`, `--days`, `--date`, or a date range
 
 If your zones aren't named `Internal`/`External`, pass `--source-zone` /
 `--dest-zone` (see `unifi-family zones`).
@@ -165,4 +180,4 @@ can and can't reach, and when.
 > VPN can evade pure domain rules. Blocking the "Tunneling and proxy services"
 > DPI category (`--app-category 11`) stops most VPN/proxy apps, but a device the
 > user fully controls can never be 100% locked down by the network alone —
-> combine with MDM/Screen Time for airtight control.
+> combine with on-device controls (MDM / Screen Time) for airtight control.
