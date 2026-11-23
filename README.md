@@ -7,6 +7,8 @@ devices.
 Because UniFi's admin panel is a royal PITA to use.
 Give this to your agent instead for faster management.
 
+9pm and kid's still playing fortnite? "turn off fortnite in the house"
+
 ## Install
 
 Uses [uv](https://docs.astral.sh/uv/). The script declares its own
