@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""
+unifi-family — a small CLI over the official UniFi Network Integration API
+(v11.0.97) for allowing/blocking websites per device (built for managing kids'
+devices).
+
+Works two ways:
+  * Local console:  base_url = https://<gateway-ip>   (LAN only)
+  * Cloud (ui.com): base_url = https://api.ui.com  +  console_id
+    (uses the UI Site Manager key; works from anywhere)
+
+Config is read from (first wins):
+  1. CLI flags --base-url / --api-key / --site
+  2. Environment: UNIFI_BASE_URL, UNIFI_API_KEY, UNIFI_SITE
+  3. ~/.config/unifi/config.json  {"base_url":..., "api_key":..., "site":...,
+                                    "verify_tls": false}
+
+base_url examples:
+  Local console:  https://192.168.1.1   (the CLI appends /proxy/network/integration)
+  Cloud connector: pass the full host and set --console-id, or just use local.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import textwrap
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    sys.exit("This CLI needs the 'requests' package. Install with: pip install requests")
+
+import urllib3
+
+CONFIG_PATH = Path(os.path.expanduser("~/.config/unifi/config.json"))
+MEMBERS_PATH = Path(os.path.expanduser("~/.config/unifi/members.json"))
+INTEGRATION_PREFIX = "/proxy/network/integration"
+
+
+def load_members() -> dict:
+    if MEMBERS_PATH.exists():
+        try:
+            return json.loads(MEMBERS_PATH.read_text())
+        except Exception as e:
+            sys.exit(f"Could not read {MEMBERS_PATH}: {e}")
+    return {}
+
+
+def save_members(members: dict):
+    MEMBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MEMBERS_PATH.write_text(json.dumps(members, indent=2))
+    MEMBERS_PATH.chmod(0o600)
+
+
+# --------------------------------------------------------------------------- #
+# Config / client
+# --------------------------------------------------------------------------- #
+class Config:
+    def __init__(self, args):
+        file_cfg = {}
+        if CONFIG_PATH.exists():
+            try:
+                file_cfg = json.loads(CONFIG_PATH.read_text())
+            except Exception as e:
+                sys.exit(f"Could not read {CONFIG_PATH}: {e}")
+
+        self.base_url = (
+            args.base_url
+            or os.environ.get("UNIFI_BASE_URL")
+            or file_cfg.get("base_url")
+        )
+        self.api_key = (
+            args.api_key
+            or os.environ.get("UNIFI_API_KEY")
+            or file_cfg.get("api_key")
+        )
+        self.site = (
+            args.site
+            or os.environ.get("UNIFI_SITE")
+            or file_cfg.get("site")
+            or "default"
+        )
+        # TLS verification: local consoles use self-signed certs -> default off.
+        verify = file_cfg.get("verify_tls", False)
+        if args.verify_tls is not None:
+            verify = args.verify_tls
+        self.verify_tls = verify
+        self.console_id = args.console_id or file_cfg.get("console_id")
+
+        if not self.base_url or not self.api_key:
+            sys.exit(
+                "Missing base_url or api_key. Set them with:\n"
+                "  unifi config --base-url https://192.168.1.1 --api-key XXXX\n"
+                "or export UNIFI_BASE_URL / UNIFI_API_KEY."
+            )
+
+        if not self.verify_tls:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    def url(self, path: str) -> str:
+        base = self.base_url.rstrip("/")
+        if self.console_id:
+            # Cloud connector form
+            return (
+                f"{base}/v1/connector/consoles/{self.console_id}"
+                f"{INTEGRATION_PREFIX}{path}"
+            )
+        return f"{base}{INTEGRATION_PREFIX}{path}"
+
+    def legacy_url(self, path: str) -> str:
+        """Legacy Network API path (/proxy/network/api/...), richer client data."""
+        base = self.base_url.rstrip("/")
+        if self.console_id:
+            return f"{base}/v1/connector/consoles/{self.console_id}/proxy/network/api{path}"
+        return f"{base}/proxy/network/api{path}"
+
+
+class Api:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.s = requests.Session()
+        self.s.headers.update(
+            {"X-API-KEY": cfg.api_key, "Accept": "application/json"}
+        )
+        self.s.verify = cfg.verify_tls
+
+    def _req(self, method, path, **kw):
+        url = self.cfg.url(path)
+        r = self.s.request(method, url, timeout=30, **kw)
+        if r.status_code >= 400:
+            body = r.text
+            try:
+                body = json.dumps(r.json(), indent=2)
+            except Exception:
+                pass
+            sys.exit(f"HTTP {r.status_code} {method} {path}\n{body}")
+        if r.status_code == 204 or not r.text:
+            return None
+        return r.json()
+
+    def get(self, path, **kw):
+        return self._req("GET", path, **kw)
+
+    def post(self, path, payload, **kw):
+        return self._req("POST", path, json=payload, **kw)
+
+    def put(self, path, payload, **kw):
+        return self._req("PUT", path, json=payload, **kw)
+
+    def patch(self, path, payload, **kw):
+        return self._req("PATCH", path, json=payload, **kw)
+
+    def delete(self, path, **kw):
+        return self._req("DELETE", path, **kw)
+
+    def legacy_get(self, path):
+        url = self.cfg.legacy_url(path)
+        r = self.s.get(url, timeout=30)
+        if r.status_code >= 400:
+            sys.exit(f"HTTP {r.status_code} GET {path}\n{r.text}")
+        return r.json().get("data", [])
+
+    # paged list helper: the API returns {data:[...], totalCount, offset, limit}
+    def get_all(self, path):
+        out, offset, limit = [], 0, 200
+        while True:
+            sep = "&" if "?" in path else "?"
+            page = self.get(f"{path}{sep}offset={offset}&limit={limit}")
+            if page is None:
+                break
+            data = page.get("data", []) if isinstance(page, dict) else page
+            out.extend(data)
+            total = page.get("totalCount", len(out)) if isinstance(page, dict) else len(out)
+            offset += limit
+            if offset >= total or not data:
+                break
+        return out
+
+
+def site_path(cfg: Config, suffix: str) -> str:
+    return f"/v1/sites/{cfg.site}/{suffix}"
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def resolve_site_id(api: Api, cfg: Config):
+    """If site == 'default' resolve to the real site id the API expects."""
+    if cfg.site and cfg.site != "default":
+        return cfg.site
+    sites = api.get_all("/v1/sites")
+    if not sites:
+        sys.exit("No sites returned from the API.")
+    cfg.site = sites[0]["id"]
+    return cfg.site
+
+
+def find_client(api: Api, cfg: Config, query: str):
+    """Match a connected client by name (case-insensitive substring), MAC, or IP."""
+    clients = api.get_all(site_path(cfg, "clients"))
+    q = query.lower()
+    matches = []
+    for c in clients:
+        name = (c.get("name") or "").lower()
+        mac = (c.get("macAddress") or "").lower()
+        ip = (c.get("ipAddress") or "").lower()
+        if q == mac or q == ip or q in name:
+            matches.append(c)
+    return matches
+
+
+DAY_NAMES = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+DAY_ALIASES = {
+    "mon": "MONDAY", "tue": "TUESDAY", "tues": "TUESDAY", "wed": "WEDNESDAY",
+    "thu": "THURSDAY", "thur": "THURSDAY", "thurs": "THURSDAY", "fri": "FRIDAY",
+    "sat": "SATURDAY", "sun": "SUNDAY",
+}
+
+
+def _parse_days(spec: str):
+    """'weekdays' | 'weekends' | 'everyday' | 'mon,wed,fri' -> list of DAY_NAMES."""
+    s = spec.strip().lower()
+    if s in ("everyday", "daily", "all"):
+        return list(DAY_NAMES)
+    if s == "weekdays":
+        return DAY_NAMES[:5]
+    if s == "weekends":
+        return DAY_NAMES[5:]
+    out = []
+    for part in s.replace(" ", "").split(","):
+        if not part:
+            continue
+        full = part.upper()
+        if full in DAY_NAMES:
+            out.append(full)
+        elif part in DAY_ALIASES:
+            out.append(DAY_ALIASES[part])
+        else:
+            sys.exit(f"Unknown day '{part}'. Use mon..sun, weekdays, weekends, or everyday.")
+    # de-dupe, keep week order
+    return [d for d in DAY_NAMES if d in out]
+
+
+def build_schedule(args):
+    """Translate scheduling flags into a firewall schedule object (or None)."""
+    time_filter = None
+    if args.start or args.stop:
+        if not (args.start and args.stop):
+            sys.exit("Provide both --start and --stop (HH:MM).")
+        time_filter = {"startTime": args.start, "stopTime": args.stop}
+
+    # One-time on a single date
+    if args.date:
+        return {
+            "mode": "ONE_TIME_ONLY",
+            "date": args.date,
+            "timeFilter": time_filter or {"startTime": "00:00", "stopTime": "23:59"},
+        }
+    # Custom date range (optionally restricted to days of week)
+    if args.start_date or args.stop_date:
+        if not (args.start_date and args.stop_date):
+            sys.exit("Provide both --start-date and --stop-date (YYYY-MM-DD).")
+        sched = {
+            "mode": "CUSTOM",
+            "startDate": args.start_date,
+            "stopDate": args.stop_date,
+            "repeatOnDays": _parse_days(args.days) if args.days else list(DAY_NAMES),
+        }
+        if time_filter:
+            sched["timeFilter"] = time_filter
+        return sched
+    # Specific days of the week
+    if args.days:
+        sched = {"mode": "EVERY_WEEK", "repeatOnDays": _parse_days(args.days)}
+        if time_filter:
+            sched["timeFilter"] = time_filter
+        return sched
+    # Every day within a time window
+    if time_filter:
+        return {"mode": "EVERY_DAY", "timeFilter": time_filter}
+    return None
+
+
+def pick_zone(zones, name_hint: str):
+    for z in zones:
+        if z.get("name", "").lower() == name_hint.lower():
+            return z
+    for z in zones:
+        if name_hint.lower() in z.get("name", "").lower():
+            return z
+    return None
+
+
+def resolve_macs(api, cfg, token: str, allow_member: bool = True):
+    """Resolve a token to a list of (mac, label). Checks members first (unless
+    allow_member is False), then a raw MAC, then a connected-client lookup.
+    Supports 'member:filter' to target specific devices within a member."""
+    members = load_members()
+
+    # member:filter  -> devices of that member whose name matches filter
+    if allow_member and ":" in token and len(token) != 17:
+        mname, _, dfilter = token.partition(":")
+        matchkey = mname.lower()
+        if matchkey in {k.lower() for k in members}:
+            real = next(k for k in members if k.lower() == matchkey)
+            devs = members[real].get("devices", [])
+            hits = [d for d in devs if dfilter.lower() in d.get("name", "").lower()
+                    or dfilter.lower() == d["mac"].lower()]
+            if not hits:
+                sys.exit(f"No device of '{real}' matches '{dfilter}'.")
+            return [(d["mac"].lower(), f"{real}:{d.get('name', d['mac'])}") for d in hits]
+
+    key = token.lower()
+    if allow_member and key in {k.lower() for k in members}:
+        real = next(k for k in members if k.lower() == key)
+        devs = members[real].get("devices", [])
+        if not devs:
+            sys.exit(f"Member '{real}' has no devices. Add one: "
+                     f"unifi-family members {real} add \"Device Name\"")
+        return [(d["mac"].lower(), f"{real}:{d.get('name', d['mac'])}") for d in devs]
+    if ":" in token and len(token) == 17:
+        return [(token.lower(), token.lower())]
+    found = find_client(api, cfg, token)
+    if not found:
+        sys.exit(f"No member or client matched '{token}'. Run: unifi-family clients")
+    if len(found) > 1:
+        lines = "\n".join(f"  {c.get('macAddress')}  {c.get('name')}" for c in found)
+        sys.exit(f"'{token}' matched several clients:\n{lines}\nUse a MAC.")
+    c = found[0]
+    return [(c["macAddress"].lower(), c.get("name", c["macAddress"]))]
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_config(args, cfg_unused):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = {}
+    if CONFIG_PATH.exists():
+        existing = json.loads(CONFIG_PATH.read_text())
+    for k in ("base_url", "api_key", "site", "console_id"):
+        v = getattr(args, k, None)
+        if v is not None:
+            existing[k] = v
+    if args.verify_tls is not None:
+        existing["verify_tls"] = args.verify_tls
+    CONFIG_PATH.write_text(json.dumps(existing, indent=2))
+    CONFIG_PATH.chmod(0o600)
+    shown = dict(existing)
+    if shown.get("api_key"):
+        shown["api_key"] = shown["api_key"][:4] + "…" + shown["api_key"][-4:]
+    print(f"Saved {CONFIG_PATH}:")
+    print(json.dumps(shown, indent=2))
+
+
+def cmd_sites(args, cfg):
+    api = Api(cfg)
+    for s in api.get_all("/v1/sites"):
+        print(f"{s['id']}\t{s.get('name','')}")
+
+
+def cmd_clients(args, cfg):
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    clients = api.get_all(site_path(cfg, "clients"))
+    clients.sort(key=lambda c: (c.get("name") or "").lower())
+    for c in clients:
+        if args.filter and args.filter.lower() not in json.dumps(c).lower():
+            continue
+        print(
+            f"{c.get('macAddress','--:--'): <18} "
+            f"{c.get('ipAddress',''): <16} "
+            f"{c.get('type',''): <9} "
+            f"{c.get('name','')}"
+        )
+
+
+def cmd_zones(args, cfg):
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    zones = api.get_all(site_path(cfg, "firewall/zones"))
+    for z in zones:
+        print(f"{z['id']}\t{z['name']}  (networks: {len(z.get('networkIds', []))})")
+
+
+def _strip_for_put(p: dict) -> dict:
+    """Remove read-only fields so a GET result can be PUT back."""
+    out = dict(p)
+    for k in ("id", "index", "metadata"):
+        out.pop(k, None)
+    return out
+
+
+def _policy_domains(p: dict):
+    df = (p.get("destination", {}).get("trafficFilter", {}) or {}).get("domainFilter")
+    if not df or df.get("type") != "DOMAINS":
+        sys.exit("This policy is not a domain-based rule; can't edit domains.")
+    return df
+
+
+def cmd_policies(args, cfg):
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    base = site_path(cfg, "firewall/policies")
+    if args.policy_cmd == "list":
+        pols = api.get_all(base)
+        for p in pols:
+            state = "on " if p.get("enabled") else "OFF"
+            act = (p.get("action") or {}).get("type", "?")
+            print(f"[{state}] {act: <6} {p.get('id','')}  {p.get('name','')}")
+    elif args.policy_cmd == "get":
+        print(json.dumps(api.get(f"{base}/{args.id}"), indent=2))
+    elif args.policy_cmd == "delete":
+        api.delete(f"{base}/{args.id}")
+        print(f"Deleted policy {args.id}")
+    elif args.policy_cmd in ("enable", "disable"):
+        p = api.get(f"{base}/{args.id}")
+        body = _strip_for_put(p)
+        body["enabled"] = args.policy_cmd == "enable"
+        api.put(f"{base}/{args.id}", body)
+        print(f"Policy {args.id} {'enabled' if body['enabled'] else 'disabled'}")
+    elif args.policy_cmd == "rename":
+        p = api.get(f"{base}/{args.id}")
+        body = _strip_for_put(p)
+        body["name"] = args.name
+        api.put(f"{base}/{args.id}", body)
+        print(f"Renamed policy {args.id} -> {args.name}")
+    elif args.policy_cmd in ("add-domain", "rm-domain", "set-domains"):
+        p = api.get(f"{base}/{args.id}")
+        body = _strip_for_put(p)
+        df = _policy_domains(body)
+        current = list(df.get("domains", []))
+        new = [d.strip().lower() for d in args.domain if d.strip()]
+        if args.policy_cmd == "set-domains":
+            result = new
+        elif args.policy_cmd == "add-domain":
+            result = current + [d for d in new if d not in current]
+        else:  # rm-domain
+            result = [d for d in current if d not in new]
+        if not result:
+            sys.exit("Refusing to leave the rule with zero domains. Delete it instead.")
+        df["domains"] = sorted(set(result))
+        if args.dry_run:
+            print(json.dumps(body, indent=2))
+            return
+        api.put(f"{base}/{args.id}", body)
+        print(f"Policy {args.id} domains now: {', '.join(df['domains'])}")
+
+
+def _build_block_policy(cfg, api, args, action):
+    zones = api.get_all(site_path(cfg, "firewall/zones"))
+    src_zone = pick_zone(zones, args.source_zone)
+    dst_zone = pick_zone(zones, args.dest_zone)
+    if not src_zone:
+        sys.exit(
+            f"Source zone '{args.source_zone}' not found. Zones: "
+            + ", ".join(z["name"] for z in zones)
+        )
+    if not dst_zone:
+        sys.exit(
+            f"Dest zone '{args.dest_zone}' not found. Zones: "
+            + ", ".join(z["name"] for z in zones)
+        )
+
+    # Resolve devices/members -> MAC addresses
+    macs = []
+    for dev in args.device:
+        for mac, _label in resolve_macs(api, cfg, dev):
+            if mac not in macs:
+                macs.append(mac)
+
+    domains = [d.strip().lower() for d in (args.domain or []) if d.strip()]
+    cat_ids = list(args.app_category or [])
+    if not domains and not cat_ids:
+        sys.exit("Need at least one --domain or --app-category.")
+    if domains and cat_ids:
+        sys.exit("Use either --domain or --app-category in one rule, not both.")
+
+    if cat_ids:
+        dest_filter = {
+            "type": "APPLICATION_CATEGORY",
+            "applicationCategoryFilter": {"applicationCategoryIds": cat_ids},
+        }
+    else:
+        dest_filter = {
+            "type": "DOMAIN",
+            "domainFilter": {"type": "DOMAINS", "domains": domains},
+        }
+
+    policy = {
+        "name": args.name,
+        "enabled": not args.disabled,
+        "action": {"type": action},
+        "loggingEnabled": False,
+        "ipProtocolScope": {"ipVersion": "IPV4_AND_IPV6"},
+        "source": {
+            "zoneId": src_zone["id"],
+            "trafficFilter": {
+                "type": "MAC_ADDRESS",
+                "macAddressFilter": {"macAddresses": macs},
+            },
+        },
+        "destination": {
+            "zoneId": dst_zone["id"],
+            "trafficFilter": dest_filter,
+        },
+    }
+    sched = build_schedule(args)
+    if sched:
+        policy["schedule"] = sched
+    return policy
+
+
+def cmd_dpi_categories(args, cfg):
+    api = Api(cfg)
+    cats = api.get("/v1/dpi/categories")
+    data = cats.get("data", cats) if isinstance(cats, dict) else cats
+    for c in sorted(data, key=lambda x: x.get("id", 0)):
+        name = c.get("name", "")
+        if args.filter and args.filter.lower() not in name.lower():
+            continue
+        print(f"{c.get('id'): <5} {name}")
+
+
+def _fmt_schedule(sched):
+    if not sched:
+        return "always"
+    mode = sched.get("mode")
+    tf = sched.get("timeFilter") or {}
+    span = f"{tf.get('startTime','')}\u2013{tf.get('stopTime','')}" if tf else ""
+    short = {"MONDAY": "Mon", "TUESDAY": "Tue", "WEDNESDAY": "Wed", "THURSDAY": "Thu",
+             "FRIDAY": "Fri", "SATURDAY": "Sat", "SUNDAY": "Sun"}
+    days = sched.get("repeatOnDays", [])
+    days = [d for d in DAY_NAMES if d in days]  # normalize to week order
+    dlabel = ""
+    if days:
+        if len(days) == 7:
+            dlabel = "daily"
+        elif days == DAY_NAMES[:5]:
+            dlabel = "weekdays"
+        elif days == DAY_NAMES[5:]:
+            dlabel = "weekends"
+        else:
+            dlabel = ",".join(short.get(d, d) for d in days)
+    if mode == "EVERY_DAY":
+        return f"daily {span}".strip()
+    if mode == "EVERY_WEEK":
+        return f"{dlabel} {span}".strip()
+    if mode == "ONE_TIME_ONLY":
+        return f"on {sched.get('date','')} {span}".strip()
+    if mode == "CUSTOM":
+        rng = f"{sched.get('startDate','')}\u2192{sched.get('stopDate','')}"
+        return f"{rng} {dlabel} {span}".strip()
+    return mode or "always"
+
+
+def _source_matches_mac(src, mac):
+    """Return 'yes'/'all'/'no' for whether a policy source applies to this MAC."""
+    tf = src.get("trafficFilter")
+    if not tf:
+        return "all"
+    t = tf.get("type")
+    if t == "MAC_ADDRESS":
+        macs = [m.lower() for m in tf.get("macAddressFilter", {}).get("macAddresses", [])]
+        return "yes" if mac in macs else "no"
+    if t == "NETWORK":
+        m = tf.get("macAddressFilter")
+        if m:
+            return "yes" if m.lower() == mac else "no"
+        return "all"  # whole network -> includes this device
+    return "all"
+
+
+def cmd_review(args, cfg):
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    targets = resolve_macs(api, cfg, args.device)
+
+    cats = {c["id"]: c["name"] for c in (api.get("/v1/dpi/categories") or {}).get("data", [])}
+    apps = {}
+    try:
+        apps = {a.get("id"): a.get("name") for a in (api.get("/v1/dpi/applications") or {}).get("data", [])}
+    except SystemExit:
+        pass
+    zones = {z["id"]: z["name"] for z in api.get_all(site_path(cfg, "firewall/zones"))}
+    pols = api.get_all(site_path(cfg, "firewall/policies"))
+
+    def target(dst):
+        tf = dst.get("trafficFilter") or {}
+        t = tf.get("type")
+        if t == "DOMAIN":
+            return ", ".join(tf["domainFilter"]["domains"])
+        if t == "APPLICATION_CATEGORY":
+            return ", ".join(cats.get(i, f"cat{i}") for i in tf["applicationCategoryFilter"]["applicationCategoryIds"])
+        if t == "APPLICATION":
+            return ", ".join(apps.get(i, f"app{i}") for i in tf["applicationFilter"].get("applicationIds", []))
+        if t is None:
+            return "everything"
+        return t
+
+    for mac, label in targets:
+        rows = []
+        for p in pols:
+            src = p.get("source", {})
+            if _source_matches_mac(src, mac) == "no":
+                continue
+            sz = zones.get(src.get("zoneId"), "")
+            dz = zones.get(p.get("destination", {}).get("zoneId"), "")
+            if not args.all and not (sz == "Internal" and dz == "External"):
+                continue
+            rows.append(p)
+        rows.sort(key=lambda p: (p.get("index", 0)))
+
+        scope_label = "all zone pairs" if args.all else "internet access (LAN \u2192 internet)"
+        print(f"\nFirewall rules affecting {label} ({mac}) \u2014 {scope_label}")
+        print("Evaluated top to bottom; the FIRST matching rule wins.\n")
+        for p in rows:
+            src = p.get("source", {})
+            dst = p.get("destination", {})
+            act = p["action"]["type"]
+            when = _fmt_schedule(p.get("schedule"))
+            scope = "this device" if _source_matches_mac(src, mac) == "yes" else "everyone"
+            on = "" if p.get("enabled") else "  (DISABLED)"
+            tgt = target(dst)
+            zp = ""
+            if args.all:
+                zp = f" [{zones.get(src.get('zoneId'),'?')}\u2192{zones.get(dst.get('zoneId'),'?')}]"
+            verb = {"ALLOW": "\u2705 ALLOW", "BLOCK": "\u26d4 BLOCK", "REJECT": "\u26d4 REJECT"}.get(act, act)
+            print(f"  {verb}  {when:<22} {scope:<11} {tgt}{zp}{on}")
+    print()
+    print("Reminder: domain/app matching uses DPI/SNI; a VPN or DoH can evade domain rules.")
+
+
+def cmd_members(args, cfg):
+    a = args.args
+    members = load_members()
+
+    # members            -> list
+    # members list       -> list
+    if not a or (len(a) == 1 and a[0] == "list"):
+        if not members:
+            print("No members yet. Add one: unifi-family members add naveen kid")
+            return
+        by_group = {}
+        for name in sorted(members):
+            by_group.setdefault(members[name].get("group", "member"), []).append(name)
+        for group in sorted(by_group):
+            print(f"[{group}]")
+            for name in by_group[group]:
+                devs = members[name].get("devices", [])
+                print(f"  {name}:")
+                if not devs:
+                    print("      (no devices)")
+                for d in devs:
+                    print(f"      {d['mac']: <18} {d.get('name','')}")
+        return
+
+    verbs_del = {"delete", "remove", "rm"}
+
+    # members add <name> [group] | members delete <name>
+    if a[0] == "add" and len(a) in (2, 3):
+        name = a[1]
+        group = a[2] if len(a) == 3 else "member"
+        if name in members:
+            sys.exit(f"Member '{name}' already exists.")
+        members[name] = {"group": group, "devices": []}
+        save_members(members)
+        print(f"Added {group} '{name}'. Now attach a device: "
+              f"unifi-family members {name} add \"Device Name\"")
+        return
+    if a[0] in verbs_del and len(a) == 2:
+        name = a[1]
+        if name not in members:
+            sys.exit(f"No such member '{name}'.")
+        del members[name]
+        save_members(members)
+        print(f"Deleted member '{name}'.")
+        return
+
+    # members <name> [show] | members <name> add/remove <device...>
+    name = a[0]
+    if name not in members:
+        sys.exit(f"No such member '{name}'. Create it: unifi-family members add {name}")
+    rest = a[1:]
+    if not rest or rest == ["show"]:
+        devs = members[name].get("devices", [])
+        print(f"{name}:")
+        for d in devs:
+            print(f"    {d['mac']: <18} {d.get('name','')}")
+        if not devs:
+            print("    (no devices)")
+        return
+
+    action, targets = rest[0], rest[1:]
+    if not targets:
+        sys.exit(f"Usage: unifi-family members {name} {action} \"Device Name\"")
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    devs = members[name].setdefault("devices", [])
+    existing = {d["mac"].lower() for d in devs}
+
+    if action == "add":
+        for t in targets:
+            for mac, label in resolve_macs(api, cfg, t, allow_member=False):
+                if mac in existing:
+                    print(f"  {mac} already on '{name}'")
+                    continue
+                # try to get a friendly name from connected clients
+                friendly = t
+                hits = find_client(api, cfg, mac)
+                if hits:
+                    friendly = hits[0].get("name", t)
+                devs.append({"mac": mac, "name": friendly})
+                existing.add(mac)
+                print(f"  added {mac} ({friendly}) to '{name}'")
+        save_members(members)
+    elif action in verbs_del:
+        for t in targets:
+            macs = [m for m, _ in resolve_macs(api, cfg, t, allow_member=False)] if t.lower() not in existing else [t.lower()]
+            before = len(devs)
+            devs[:] = [d for d in devs if d["mac"].lower() not in {m.lower() for m in macs}]
+            print(f"  removed {before - len(devs)} device(s) matching '{t}' from '{name}'")
+        save_members(members)
+    else:
+        sys.exit(f"Unknown action '{action}'. Use add or remove.")
+
+
+def cmd_devices(args, cfg):
+    import datetime
+    api = Api(cfg)
+    site = "default"  # legacy API uses the internal site name
+    sta = api.legacy_get(f"/s/{site}/stat/sta")
+
+    def ts(v):
+        try:
+            return datetime.datetime.fromtimestamp(v).strftime("%Y-%m-%d") if v else "-"
+        except Exception:
+            return "-"
+
+    def name(c):
+        return c.get("name") or c.get("hostname") or "(unnamed)"
+
+    rows = sorted(sta, key=lambda c: name(c).lower())
+    if args.filter:
+        f = args.filter.lower()
+        rows = [c for c in rows if f in json.dumps(c).lower()]
+    for c in rows:
+        mac = c.get("mac", "")
+        randomized = len(mac) == 17 and mac[1] in "2367abef"  # locally-administered bit
+        rtag = "  (randomized MAC)" if randomized else ""
+        print(f"\n\u25cf {name(c)}   [{mac}]  {c.get('ip', c.get('last_ip','-'))}{rtag}")
+        print(f"    maker: {c.get('oui') or '-'}   hostname: {c.get('hostname','-')}")
+        if c.get("is_wired"):
+            conn = f"wired via {c.get('last_uplink_name','-')}"
+        else:
+            conn = (f"wifi '{c.get('essid','-')}' via {c.get('last_uplink_name', c.get('ap_mac','-'))}"
+                    f"  rssi={c.get('rssi','-')}")
+        print(f"    conn: {conn}")
+        print(f"    first seen {ts(c.get('first_seen'))}   last seen {ts(c.get('last_seen'))}"
+              f"   fp[v{c.get('dev_vendor','?')}/f{c.get('dev_family','?')}/o{c.get('os_name','?')}/c{c.get('dev_cat','?')}]")
+
+
+def cmd_block(args, cfg):
+    api = Api(cfg)
+    resolve_site_id(api, cfg)
+    action = "ALLOW" if args.allow else "BLOCK"
+    if not args.name:
+        verb = "Allow" if args.allow else "Block"
+        if args.app_category:
+            tgt = "category " + ",".join(str(c) for c in args.app_category)
+        else:
+            tgt = ",".join(args.domain or [])[:30]
+        args.name = f"{verb} {tgt} for {','.join(args.device)}"
+    policy = _build_block_policy(cfg, api, args, action)
+    if args.dry_run:
+        print(json.dumps(policy, indent=2))
+        return
+    created = api.post(site_path(cfg, "firewall/policies"), policy)
+    print(f"Created {action} policy: {created.get('id')}  {created.get('name')}")
+
+
+# --------------------------------------------------------------------------- #
+# Arg parsing
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="unifi-family",
+        description="Manage UniFi firewall policies to allow/block websites per device.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """
+            Examples:
+              unifi-family config --base-url https://api.ui.com --api-key XXXX --console-id <id>
+              unifi-family clients
+              unifi-family zones
+              unifi-family block "Kids iPad" --domain tiktok.com --domain youtube.com
+              unifi-family block "Kids iPad" --domain roblox.com --start 21:00 --stop 07:00
+              unifi-family block --allow "Kids iPad" --domain khanacademy.org
+              unifi-family block "Kids iPad" --app-category 11   # VPN/proxy
+              unifi-family review "Kids iPad"
+              unifi-family policies list
+              unifi-family policies disable <id>
+              unifi-family policies delete <id>
+            """
+        ),
+    )
+    p.add_argument("--base-url")
+    p.add_argument("--api-key")
+    p.add_argument("--site")
+    p.add_argument("--console-id", help="Cloud connector console id (optional)")
+    p.add_argument(
+        "--verify-tls",
+        dest="verify_tls",
+        action="store_true",
+        default=None,
+        help="Verify TLS cert (off by default for local self-signed consoles)",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("config", help="Save connection settings")
+    c.add_argument("--base-url")
+    c.add_argument("--api-key")
+    c.add_argument("--site")
+    c.add_argument("--console-id")
+    c.add_argument("--verify-tls", dest="verify_tls", action="store_true", default=None)
+    c.set_defaults(func=cmd_config, needs_cfg=False)
+
+    s = sub.add_parser("sites", help="List sites")
+    s.set_defaults(func=cmd_sites)
+
+    cl = sub.add_parser("clients", help="List connected clients (name, MAC, IP)")
+    cl.add_argument("filter", nargs="?", help="Filter substring")
+    cl.set_defaults(func=cmd_clients)
+
+    z = sub.add_parser("zones", help="List firewall zones")
+    z.set_defaults(func=cmd_zones)
+
+    dc = sub.add_parser("dpi-categories", help="List DPI application categories (ids for --app-category)")
+    dc.add_argument("filter", nargs="?", help="Filter substring")
+    dc.set_defaults(func=cmd_dpi_categories)
+
+    dv = sub.add_parser("devices", help="Rich per-client detail (maker, hostname, AP, seen) for mapping")
+    dv.add_argument("filter", nargs="?", help="Filter substring")
+    dv.set_defaults(func=cmd_devices)
+
+    rv = sub.add_parser("review", help="Show all firewall rules affecting a device, in evaluation order")
+    rv.add_argument("device", help="Device name / MAC / IP / member")
+    rv.add_argument("--all", action="store_true", help="Show every zone pair (default: only LAN\u2192internet)")
+    rv.set_defaults(func=cmd_review)
+
+    mm = sub.add_parser("members", help="Manage family members and their devices")
+    mm.add_argument("args", nargs="*",
+                    help="list | add <name> [group] | delete <name> | <name> [add|remove <device>]")
+    mm.set_defaults(func=cmd_members)
+
+    pol = sub.add_parser("policies", help="List/get/delete/enable/disable/edit policies")
+    psub = pol.add_subparsers(dest="policy_cmd", required=True)
+    psub.add_parser("list")
+    for name in ("get", "delete", "enable", "disable"):
+        sp = psub.add_parser(name)
+        sp.add_argument("id")
+    rn = psub.add_parser("rename")
+    rn.add_argument("id")
+    rn.add_argument("name")
+    for name in ("add-domain", "rm-domain", "set-domains"):
+        sp = psub.add_parser(name, help=f"{name} on an existing domain policy")
+        sp.add_argument("id")
+        sp.add_argument("domain", nargs="+", help="Domain(s)")
+        sp.add_argument("--dry-run", action="store_true")
+    pol.set_defaults(func=cmd_policies)
+
+    b = sub.add_parser("block", help="Create a policy blocking (or allowing) domains for a device")
+    b.add_argument("device", nargs="+", help="Device name / MAC / IP (one or more)")
+    b.add_argument("--domain", action="append", help="Domain to match (repeatable)")
+    b.add_argument("--app-category", type=int, action="append", help="DPI category id to match (repeatable). See: unifi dpi-categories")
+    b.add_argument("--allow", action="store_true", help="Make it an ALLOW rule instead of BLOCK")
+    b.add_argument("--name", help="Policy name")
+    b.add_argument("--source-zone", default="Internal", help="Source zone name (default: Internal)")
+    b.add_argument("--dest-zone", default="External", help="Destination zone name (default: External)")
+    b.add_argument("--start", help="Active window start HH:MM")
+    b.add_argument("--stop", help="Active window stop HH:MM")
+    b.add_argument("--days", help="Days of week: mon,wed,fri | weekdays | weekends | everyday")
+    b.add_argument("--date", help="One-time only on YYYY-MM-DD")
+    b.add_argument("--start-date", dest="start_date", help="Custom range start YYYY-MM-DD")
+    b.add_argument("--stop-date", dest="stop_date", help="Custom range stop YYYY-MM-DD")
+    b.add_argument("--disabled", action="store_true", help="Create disabled")
+    b.add_argument("--dry-run", action="store_true", help="Print payload, don't send")
+    b.set_defaults(func=cmd_block)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "needs_cfg", True) is False:
+        args.func(args, None)
+        return
+    cfg = Config(args)
+    args.func(args, cfg)
+
+
+if __name__ == "__main__":
+    main()
