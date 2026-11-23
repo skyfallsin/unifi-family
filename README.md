@@ -4,6 +4,9 @@ A small CLI over the official **UniFi Network Integration API** (v11.0.97) for
 allowing/blocking websites on specific devices — built for managing a family's
 devices.
 
+Because UniFi's admin panel is a royal PITA to use.
+Give this to your agent instead for faster management.
+
 ## Install
 
 Uses [uv](https://docs.astral.sh/uv/). The script declares its own
@@ -21,6 +24,16 @@ unifi-family --help
 ```
 
 (If you don't have uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`.)
+
+## Tests
+
+```bash
+uv run --with pytest --with requests --with urllib3 python -m pytest -q
+```
+
+The suite covers the pure logic — schedule building and formatting, day
+parsing, member/device resolution, rule-source matching, zone selection, and
+URL construction — with no network or live controller.
 
 ## Connect
 
